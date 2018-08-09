@@ -40,6 +40,10 @@ import (
 var (
 	errRootFSMismatch = errors.New("layers from manifest don't match image configuration")
 	errRootFSInvalid  = errors.New("invalid rootfs in image configuration")
+	sourcePlatform    = &specs.Platform{
+		Architecture: "source",
+		OS: "linux",
+	}
 )
 
 // ImageConfigPullError is an error pulling the image config blob
@@ -385,6 +389,8 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 	var (
 		id             digest.Digest
 		manifestDigest digest.Digest
+		sourceId             digest.Digest
+		sourceManifestDigest digest.Digest
 	)
 
 	switch v := manifest.(type) {
@@ -392,11 +398,17 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 		if p.config.RequireSchema2 {
 			return false, fmt.Errorf("invalid manifest: not schema2")
 		}
+		if p.config.PullSource {
+			return false, fmt.Errorf("cannot pull source image from image manifest")
+		}
 		id, manifestDigest, err = p.pullSchema1(ctx, ref, v, platform)
 		if err != nil {
 			return false, err
 		}
 	case *schema2.DeserializedManifest:
+		if p.config.PullSource {
+			return false, fmt.Errorf("cannot pull source image from image manifest")
+		}
 		id, manifestDigest, err = p.pullSchema2(ctx, ref, v, platform)
 		if err != nil {
 			return false, err
@@ -406,33 +418,89 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 		if err != nil {
 			return false, err
 		}
+		if p.config.PullSource {
+			progress.Message(p.config.ProgressOutput, tagOrDigest, "Pulling source from "+reference.FamiliarName(p.repo.Named())+" as "+reference.FamiliarName(p.repo.Named())+"-source")
+			sourceId, sourceManifestDigest, err = p.pullManifestList(ctx, ref, v, sourcePlatform)
+			if err != nil {
+				return false, err
+			}
+		}
 	default:
 		return false, invalidManifestFormatError{}
 	}
 
 	progress.Message(p.config.ProgressOutput, "", "Digest: "+manifestDigest.String())
+	if p.config.PullSource {
+		progress.Message(p.config.ProgressOutput, "", "Digest: "+sourceManifestDigest.String())
+	}
 
 	if p.config.ReferenceStore != nil {
-		oldTagID, err := p.config.ReferenceStore.Get(ref)
-		if err == nil {
-			if oldTagID == id {
-				return false, addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id)
+		if platform != nil && platform.OS == sourcePlatform.OS && platform.Architecture == sourcePlatform.Architecture {
+			// Pulling image as source, change name to reflect this
+			sourceName := ref.Name() + "-source"
+			if _, isTagged := ref.(reference.NamedTagged); isTagged {
+				ref, err = reference.ParseNormalizedNamed(sourceName + ":" + tagOrDigest)
+				if err != nil {
+					return false, err
+				}
+			} else {
+				ref, err = reference.ParseNormalizedNamed(sourceName)
+				if err != nil {
+					return false, err
+				}
 			}
-		} else if err != refstore.ErrDoesNotExist {
-			return false, err
-		}
-
-		if canonical, ok := ref.(reference.Canonical); ok {
-			if err = p.config.ReferenceStore.AddDigest(canonical, id, true); err != nil {
-				return false, err
+			if tagUpdated, err = p.storeImage(ref, id, manifestDigest); err != nil {
+				return tagUpdated, err
 			}
 		} else {
-			if err = addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
-				return false, err
+			if tagUpdated, err = p.storeImage(ref, id, manifestDigest); err != nil {
+				return tagUpdated, err
 			}
-			if err = p.config.ReferenceStore.AddTag(ref, id, true); err != nil {
-				return false, err
+			if p.config.PullSource {
+				// Add "-source" to the end of the source ref name to differentiate from the binary image
+				// Use the same tag as the binary image
+				var sourceRef reference.Named
+				sourceName := ref.Name() + "-source"
+				if _, isTagged := ref.(reference.NamedTagged); isTagged {
+					sourceRef, err = reference.ParseNormalizedNamed(sourceName + ":" + tagOrDigest)
+					if err != nil {
+						return false, err
+					}
+				} else {
+					sourceRef, err = reference.ParseNormalizedNamed(sourceName)
+					if err != nil {
+						return false, err
+					}
+				}
+				if tagUpdated, err = p.storeImage(sourceRef, sourceId, sourceManifestDigest); err != nil {
+					return tagUpdated, err
+				}
 			}
+		}
+	}
+	return true, nil
+}
+
+func (p *v2Puller) storeImage(ref reference.Named, id, manifestDigest digest.Digest) (bool, error) {
+	oldTagID, err := p.config.ReferenceStore.Get(ref)
+	if err == nil {
+		if oldTagID == id {
+			return false, addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id)
+		}
+	} else if err != refstore.ErrDoesNotExist {
+		return false, err
+	}
+
+	if canonical, ok := ref.(reference.Canonical); ok {
+		if err = p.config.ReferenceStore.AddDigest(canonical, id, true); err != nil {
+			return false, err
+		}
+	} else {
+		if err = addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
+			return false, err
+		}
+		if err = p.config.ReferenceStore.AddTag(ref, id, true); err != nil {
+			return false, err
 		}
 	}
 	return true, nil
